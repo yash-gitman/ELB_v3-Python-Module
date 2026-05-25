@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ELB.py Code Viewer</title>
+
+<style>
+    body {
+        margin: 0;
+        padding: 40px;
+        background: #0f1117;
+        font-family: Consolas, monospace;
+        color: white;
+    }
+
+    .container {
+        max-width: 1200px;
+        margin: auto;
+        background: #1a1d29;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 0 20px rgba(0,0,0,0.4);
+    }
+
+    .topbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 15px 20px;
+        background: #242938;
+        border-bottom: 1px solid #333;
+    }
+
+    .filename {
+        font-size: 16px;
+        color: #cfd8ff;
+    }
+
+    .copy-btn {
+        background: #3b82f6;
+        color: white;
+        border: none;
+        padding: 8px 16px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 14px;
+        transition: 0.2s;
+    }
+
+    .copy-btn:hover {
+        background: #2563eb;
+    }
+
+    pre {
+        margin: 0;
+        padding: 25px;
+        overflow-x: auto;
+        font-size: 14px;
+        line-height: 1.5;
+        color: #d4d4d4;
+    }
+
+    code {
+        white-space: pre;
+    }
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <div class="topbar">
+        <div class="filename">ELB.py</div>
+
+        <button class="copy-btn" onclick="copyCode()">
+            Copy Code
+        </button>
+    </div>
+
+<pre><code id="codeBlock">
+# ELB.py
+import framebuf
+import random
+from micropython import const
+from machine import Pin, PWM, Timer, bitstream
+from array import array
+from utime import ticks_us, ticks_diff, ticks_ms, sleep_ms
+
+# SSD1306 register definitions
+SET_CONTRAST        = const(0x81)
+SET_ENTIRE_ON       = const(0xA4)
+SET_NORM_INV        = const(0xA6)
+SET_DISP            = const(0xAE)
+SET_MEM_ADDR        = const(0x20)
+SET_COL_ADDR        = const(0x21)
+SET_PAGE_ADDR       = const(0x22)
+SET_DISP_START_LINE = const(0x40)
+SET_SEG_REMAP       = const(0xA0)
+SET_MUX_RATIO       = const(0xA8)
+SET_COM_OUT_DIR     = const(0xC0)
+SET_DISP_OFFSET     = const(0xD3)
+SET_COM_PIN_CFG     = const(0xDA)
+SET_DISP_CLK_DIV    = const(0xD5)
+SET_PRECHARGE       = const(0xD9)
+SET_VCOM_DESEL      = const(0xDB)
+SET_CHARGE_PUMP     = const(0x8D)
+
+class SSD1306(framebuf.FrameBuffer):
+    def __init__(self, width, height, external_vcc):
+        self.width = width
+        self.height = height
+        self.external_vcc = external_vcc
+        self.pages = self.height // 8
+        self.buffer = bytearray(self.pages * self.width)
+        super().__init__(self.buffer, self.width, self.height, framebuf.MONO_VLSB)
+        self.init_display()
+
+    def init_display(self):
+        for cmd in (
+            SET_DISP | 0x00,
+            SET_MEM_ADDR, 0x00,
+            SET_DISP_START_LINE | 0x00,
+            SET_SEG_REMAP | 0x01,
+            SET_MUX_RATIO, self.height - 1,
+            SET_COM_OUT_DIR | 0x08,
+            SET_DISP_OFFSET, 0x00,
+            SET_COM_PIN_CFG, 0x02 if self.width > 2 * self.height else 0x12,
+            SET_DISP_CLK_DIV, 0x80,
+            SET_PRECHARGE, 0x22 if self.external_vcc else 0xF1,
+            SET_VCOM_DESEL, 0x30,
+            SET_CONTRAST, 0xFF,
+            SET_ENTIRE_ON,
+            SET_NORM_INV,
+            SET_CHARGE_PUMP, 0x10 if self.external_vcc else 0x14,
+            SET_DISP | 0x01,
+        ):
+            self.write_cmd(cmd)
+        self.fill(0)
+        self.show()
+
+    def poweroff(self):
+        self.write_cmd(SET_DISP | 0x00)
+
+    def poweron(self):
+        self.write_cmd(SET_DISP | 0x01)
+
+    def contrast(self, contrast):
+        self.write_cmd(SET_CONTRAST)
+        self.write_cmd(contrast)
+
+    def invert(self, invert):
+        self.write_cmd(SET_NORM_INV | (invert & 1))
+
+    def show(self):
+        x0 = 0
+        x1 = self.width - 1
+        if self.width == 64:
+            x0 += 32
+            x1 += 32
+        self.write_cmd(SET_COL_ADDR)
+        self.write_cmd(x0)
+        self.write_cmd(x1)
+        self.write_cmd(SET_PAGE_ADDR)
+        self.write_cmd(0)
+        self.write_cmd(self.pages - 1)
+        self.write_data(self.buffer)
+
+# I2C version of the driver
+class SSD1306_I2C(SSD1306):
+    def __init__(self, width, height, i2c, addr=0x3C, external_vcc=False):
+        self.i2c = i2c
+        self.addr = addr
+        self.temp = bytearray(2)
+        self.write_list = [b'\x40', None]
+        super().__init__(width, height, external_vcc)
+
+    def write_cmd(self, cmd):
+        self.temp[0] = 0x80
+        self.temp[1] = cmd
+        self.i2c.writeto(self.addr, self.temp)
+
+    def write_data(self, buf):
+        self.write_list[1] = buf
+        self.i2c.writevto(self.addr, self.write_list)
+
+# SPI version of the driver
+class SSD1306_SPI(SSD1306):
+    def __init__(self, width, height, spi, dc, res, cs, external_vcc=False):
+        self.rate = 10_000_000
+        dc.init(dc.OUT, value=0)
+        res.init(res.OUT, value=0)
+        cs.init(cs.OUT, value=1)
+        self.spi = spi
+        self.dc = dc
+        self.res = res
+        self.cs = cs
+        self.res(1)
+        sleep_ms(1)
+        self.res(0)
+        sleep_ms(10)
+        self.res(1)
+        super().__init__(width, height, external_vcc)
+
+    def write_cmd(self, cmd):
+        self.spi.init(baudrate=self.rate, polarity=0, phase=0)
+        self.cs(1)
+        self.dc(0)
+        self.cs(0)
+        self.spi.write(bytearray([cmd]))
+        self.cs(1)
+
+    def write_data(self, buf):
+        self.spi.init(baudrate=self.rate, polarity=0, phase=0)
+        self.cs(1)
+        self.dc(1)
+        self.cs(0)
+        self.spi.write(buf)
+        self.cs(1)
+
+# SG90 servo class
+class Servo:
+    def __init__(self, pin, min_duty=1638, max_duty=7864):
+        """
+        Initialize servo on specified pin
+        Default duty cycles: 1638 (0°) and 7864 (180°) for 50Hz PWM
+        """
+        self.pwm = PWM(Pin(pin))
+        self.pwm.freq(50)  # Set frequency to 50 Hz
+        self.min_duty = min_duty
+        self.max_duty = max_duty
+   
+    def angle_to_duty(self, angle):
+        # Map angle (0-180) to duty cycle value
+        if angle < 0:
+            angle = 0
+        elif angle > 180:
+            angle = 180
+        return int(self.min_duty + (self.max_duty - self.min_duty) * angle / 180)
+   
+    def set_angle(self, angle):
+        # Set servo to specified angle (automatically clamped to 0-180 degrees)
+        if angle < 0:
+            angle = 0
+        elif angle > 180:
+            angle = 180
+           
+        duty = self.angle_to_duty(angle)
+        self.pwm.duty_u16(duty)
+   
+    def min_position(self):
+        # Move servo to minimum position (0°)
+        self.set_angle(0)
+  
+    def max_position(self):
+        # Move servo to maximum position (180°)
+        self.set_angle(180)
+   
+    def deinit(self):
+        # Clean up PWM resource
+        self.pwm.deinit()
+
+def lights(np, total_leds, distance):
+    if distance is None:
+        return
+
+    max_d = 50
+    min_d = 2
+
+    # Limit range
+    if distance > max_d:
+        distance = max_d
+    if distance < min_d:
+        distance = min_d
+
+    # Calculate how many LEDs should stay ON
+    leds_on = int((distance - min_d) /
+                  (max_d - min_d) * total_leds)
+
+    for i in range(total_leds):
+        if i < leds_on:
+            # Color based on distance
+            if distance > 30:
+                color = (0, 255, 0)      # Green
+            elif distance > 15:
+                color = (255, 150, 0)    # Yellow
+            else:
+                color = (255, 0, 0)      # Red
+            np[i] = color
+        else:
+            np[i] = (0, 0, 0)
+    np.write()
+
+def clear_leds(np, total_leds):
+    for i in range(total_leds):
+        np[i] = (0, 0, 0)
+    np.write()
+
+# Buzzer function
+def beep(buzzer, distance):
+    if distance is None:
+        buzzer.duty_u16(0)
+        return
+
+    # Very close
+    if distance < 5:
+        buzzer.duty_u16(30000)
+        sleep_ms(100)
+        buzzer.duty_u16(0)
+        sleep_ms(100)
+
+    # Close
+    elif distance < 10:
+        buzzer.duty_u16(30000)
+        sleep_ms(100)
+        buzzer.duty_u16(0)
+        sleep_ms(100)
+
+    # Medium
+    elif distance < 20:
+        buzzer.duty_u16(30000)
+        sleep_ms(300)
+        buzzer.duty_u16(0)
+        sleep_ms(300)
+
+    # Safe
+    else:
+        buzzer.duty_u16(0)
+
+class GameScreen:
+    def __init__(self, i2c):
+        # Create OLED display using the driver from this file
+        self.oled = SSD1306_I2C(128, 64, i2c)
+        self.game_over = False
+      
+    def clear(self):
+        # Clear the screen (make it black)
+        self.oled.fill(0)
+  
+    def draw_bird(self, x, y):
+        # Draw the bird as a small square
+        self.oled.fill_rect(int(x), int(y), 4, 4, 1)
+  
+    def draw_top_pipe(self, x, height):
+        # Draw pipe from the top of the screen
+        self.oled.fill_rect(int(x), 0, 10, int(height), 1)
+  
+    def draw_bottom_pipe(self, x, height):
+        # Draw pipe from the bottom of the screen
+        y = 64 - height
+        self.oled.fill_rect(int(x), int(y), 10, int(height), 1)
+  
+    def show(self):
+        # Show everything we drew on the screen
+        self.oled.show()
+  
+    def show_game_over(self):
+        # Display Game Over message
+        self.clear()
+        self.oled.text("GAME OVER", 30, 30, 1)
+        self.show()
+        self.game_over = True
+
+    def update_pipe(self, pipe_x, top_pipe_height, gap, speed=2):
+        """
+        This function:
+        - Moves the pipe to the left
+        - Creates a new pipe when it goes off screen
+        - Calculates bottom pipe height
+        """
+        # Move pipe left
+        pipe_x -= speed
+
+        # If pipe goes out of screen, create a new one
+        if pipe_x < -10:
+            pipe_x = 128
+            top_pipe_height = random.randint(10, 25)
+
+        # Calculate bottom pipe height
+        bottom_pipe_height = 64 - (top_pipe_height + gap)
+
+        return pipe_x, top_pipe_height, bottom_pipe_height
+    
+# IR_RX — abstract base class
+class IR_RX:
+    Timer_id = -1   # Software timer; override if needed
+    # Result / error codes
+    REPEAT   = -1
+    BADSTART = -2
+    BADBLOCK = -3
+    BADREP   = -4
+    OVERRUN  = -5
+    BADDATA  = -6
+    BADADDR  = -7
+
+    def __init__(self, pin, nedges, tblock, callback, *args):
+        self._pin   = pin
+        self._nedges = nedges
+        self._tblock = tblock
+        self.callback = callback
+        self.args     = args
+        self._errf    = lambda _: None
+        self.verbose  = False
+
+        self._times = array("i", (0 for _ in range(nedges + 1)))  # +1 for overrun
+        pin.irq(handler=self._cb_pin, trigger=(Pin.IRQ_FALLING | Pin.IRQ_RISING))
+        self.edge = 0
+        self.tim  = Timer(self.Timer_id)
+        self.cb   = self.decode
+
+    def _cb_pin(self, line):
+        t = ticks_us()
+        if self.edge <= self._nedges:
+            if not self.edge:
+                self.tim.init(period=self._tblock, mode=Timer.ONE_SHOT, callback=self.cb)
+            self._times[self.edge] = t
+            self.edge += 1
+
+    def do_callback(self, cmd, addr, ext, thresh=0):
+        self.edge = 0
+        if cmd >= thresh:
+            self.callback(cmd, addr, ext, *self.args)
+        else:
+            self._errf(cmd)
+
+    def error_function(self, func):
+        self._errf = func
+
+    def close(self):
+        self._pin.irq(handler=None)
+        self.tim.deinit()
+
+# NEC_ABC — NEC / Samsung protocol decoder
+class NEC_ABC(IR_RX):
+    def __init__(self, pin, extended, samsung, callback, *args):
+        # Block lasts <= 80 ms (extended) and has 68 edges
+        super().__init__(pin, 68, 80, callback, *args)
+        self._extended = extended
+        self._addr     = 0
+        self._leader   = 2500 if samsung else 4000   # µs threshold
+
+    def decode(self, _):
+        try:
+            if self.edge > 68:
+                raise RuntimeError(self.OVERRUN)
+            width = ticks_diff(self._times[1], self._times[0])
+            if width < self._leader:
+                raise RuntimeError(self.BADSTART)
+            width = ticks_diff(self._times[2], self._times[1])
+            if width > 3000:                  # normal data frame
+                if self.edge < 68:
+                    raise RuntimeError(self.BADBLOCK)
+                val = 0
+                for edge in range(3, 68 - 2, 2):
+                    val >>= 1
+                    if ticks_diff(self._times[edge + 1], self._times[edge]) > 1120:
+                        val |= 0x80000000
+            elif width > 1700:                # repeat frame
+                raise RuntimeError(self.REPEAT if self.edge == 4 else self.BADREP)
+            else:
+                raise RuntimeError(self.BADSTART)
+
+            addr = val & 0xff
+            cmd  = (val >> 16) & 0xff
+            if cmd != (val >> 24) ^ 0xff:
+                raise RuntimeError(self.BADDATA)
+            if addr != ((val >> 8) ^ 0xff) & 0xff:
+                if not self._extended:
+                    raise RuntimeError(self.BADADDR)
+                addr |= val & 0xff00
+            self._addr = addr
+        except RuntimeError as e:
+            cmd  = e.args[0]
+            addr = self._addr if cmd == self.REPEAT else 0
+
+        self.do_callback(cmd, addr, 0, self.REPEAT)
+
+# Concrete NEC / Samsung subclasses
+class NEC_8(NEC_ABC):
+    def __init__(self, pin, callback, *args):
+        super().__init__(pin, False, False, callback, *args)
+
+class NEC_16(NEC_ABC):
+    def __init__(self, pin, callback, *args):
+        super().__init__(pin, True, False, callback, *args)
+
+class SAMSUNG(NEC_ABC):
+    def __init__(self, pin, callback, *args):
+        super().__init__(pin, True, True, callback, *args)
+
+# ir_receiver class — high-level wrapper
+class ir_receiver:
+    def __init__(self, pin):
+        self._code    = None
+        self._addr    = None
+        self._pending = False
+        self._nec     = NEC_8(pin, self._store)
+
+    def _store(self, cmd, addr, ext):
+        if cmd == -1:
+            if self._code is not None:
+                self._pending = True
+        elif cmd >= 0:
+            self._code    = cmd
+            self._addr    = addr
+            self._pending = True
+        
+    def _read(self):
+        if not self._pending:
+            return None
+        self._pending = False
+        return self._code
+
+    def get_code(self):
+        return self._read()
+
+    def get_code_hex(self):
+        code = self._read()
+        if code is None:
+            return None
+        return hex(code)
+
+    def get_code_bin(self):
+        code = self._read()
+        if code is None:
+            return None
+        return '0b' + '{:08b}'.format(code)
+
+    def get_addr(self):
+        return self._addr
+
+    def close(self):
+        self._nec.close()
+        
+# Modified NeoPixel class for MicroPython Pi-Pico
+# from machine import bitstream
+class NeoPixel:
+    # G R B W
+    ORDER = (1, 0, 2, 3)
+    MAX_BRIGHTNESS = 100  # maximum allowed value per channel
+
+    def __init__(self, pin, n, bpp=3, timing=1):
+        self.pin = pin
+        self.n = n
+        self.bpp = bpp
+        self.buf = bytearray(n * bpp)
+        self.pin.init(pin.OUT)
+        # Timing arg can either be 1 for 800kHz or 0 for 400kHz,
+        # or a user-specified timing ns tuple (high_0, low_0, high_1, low_1).
+        self.timing = (
+            ((400, 850, 800, 450) if timing else (800, 1700, 1600, 900))
+            if isinstance(timing, int)
+            else timing
+        )
+
+    def __len__(self):
+        return self.n
+
+    def __setitem__(self, i, v):
+        offset = i * self.bpp
+        for j in range(self.bpp):
+            # Cap each color value to MAX_BRIGHTNESS
+            self.buf[offset + self.ORDER[j]] = min(v[j], self.MAX_BRIGHTNESS)
+
+    def __getitem__(self, i):
+        offset = i * self.bpp
+        return tuple(self.buf[offset + self.ORDER[j]] for j in range(self.bpp))
+
+    def fill(self, v):
+        b = self.buf
+        l = len(self.buf)
+        bpp = self.bpp
+        for i in range(bpp):
+            # Cap value here too
+            c = min(v[i], self.MAX_BRIGHTNESS)
+            j = self.ORDER[i]
+            while j < l:
+                b[j] = c
+                j += bpp
+
+    def write(self):
+        # BITSTREAM_TYPE_HIGH_LOW = 0
+        bitstream(self.pin, 0, self.timing, self.buf)
+ 
+# ---------------- SNAKE GAME CLASS----------------
+class SnakeGame:
+    def __init__(self, oled, button, cell_size=4):
+        self.oled = oled
+        self.button = button  # Button pin object passed from main.py
+        self.CELL = cell_size
+        self.WIDTH = 128
+        self.HEIGHT = 64
+        self.GRID_W = self.WIDTH // cell_size
+        self.GRID_H = self.HEIGHT // cell_size
+        self.UP    = (0, -1)
+        self.DOWN  = (0, 1)
+        self.LEFT  = (-1, 0)
+        self.RIGHT = (1, 0)
+        self.INITIAL_LENGTH = 4
+        self.INITIAL_SPEED = 200
+        self.alive = True  # Track if snake is alive
+
+    # ---------------- Button Wait ----------------
+    def wait_for_button(self):
+        """Wait for button press and release"""
+        while self.button.value() == 1:  # Wait for press (button goes low)
+            pass
+        while self.button.value() == 0:  # Wait for release (button goes high)
+            pass
+
+    def is_button_pressed(self):
+        """Check if button is currently pressed"""
+        return self.button.value() == 0
+
+    # ---------------- Screen Messages ----------------
+    def start_game_message(self):
+        # Show start screen with game title
+        self.oled.fill(0)  # Clear screen
+        self.oled.text("SNAKE GAME", 20, 10)
+        self.oled.text("Press Button", 15, 30)
+        self.oled.show()
+    
+    def game_over_message(self):
+        # Show game over screen with final score
+        self.oled.fill(0)  # Clear screen
+        self.oled.text("GAME OVER!", 20, 10)
+        self.oled.text("Score: " + str(self.score), 20, 30)
+        self.oled.text("Press Button", 10, 50)
+        self.oled.show()
+
+    def pause_message(self):
+        # Optional: Show pause screen
+        self.oled.fill(0)
+        self.oled.text("PAUSED", 45, 30)
+        self.oled.text("Press Button", 15, 50)
+        self.oled.show()
+
+    # ---------------- Utility ----------------
+    def clear(self):
+        # Clear the OLED screen
+        self.oled.fill(0)
+
+    def draw_cell(self, x, y):
+        # Draw a single cell (snake segment or food)
+        px = x * self.CELL
+        py = y * self.CELL
+        self.oled.fill_rect(px, py, self.CELL, self.CELL, 1)
+
+    # ---------------- Setup ----------------
+    def new_game(self):
+        # Initialize new game state
+        cx = self.GRID_W // 2
+        cy = self.GRID_H // 2       
+        self.snake = [(cx - i, cy) for i in range(self.INITIAL_LENGTH)]
+        self.direction = self.RIGHT
+        self.score = 0
+        self.speed = self.INITIAL_SPEED
+        self.last_move = ticks_ms()
+        self.food = self.place_food()
+        self.alive = True
+
+    # ---------------- Food ----------------
+    def place_food(self):
+        """
+        Place food at random position not occupied by snake and not under score text.
+        Score area is top-left: x from 0 to 50, y from 0 to 8 (text area)
+        """
+        # Define forbidden area for food (score text area)
+        SCORE_AREA_X_MAX = 50  # Score text takes about 50 pixels width
+        SCORE_AREA_Y_MAX = 8   # Text height is 8 pixels
+        SCORE_GRID_X_MAX = SCORE_AREA_X_MAX // self.CELL
+        SCORE_GRID_Y_MAX = SCORE_AREA_Y_MAX // self.CELL
+        
+        while True:
+            t = ticks_ms()
+            fx = (t // 9) % self.GRID_W
+            fy = (t // 7) % self.GRID_H
+            
+            # Check if food would be under score text area
+            if fx < SCORE_GRID_X_MAX and fy < SCORE_GRID_Y_MAX:
+                continue  # Food would be hidden under score, try again
+            
+            # Check if food is on snake
+            if (fx, fy) not in self.snake:
+                return (fx, fy)
+
+    # ---------------- Direction ----------------
+    def update_direction(self, new_dir):
+        # Update snake direction with collision prevention
+        opposite = {
+            self.UP: self.DOWN,
+            self.DOWN: self.UP,
+            self.LEFT: self.RIGHT,
+            self.RIGHT: self.LEFT
+        }
+
+        if new_dir and new_dir != opposite[self.direction]:
+            self.direction = new_dir
+
+    # ---------------- Game Logic ----------------
+    def is_snake_dead(self):
+        # Check if snake is dead
+        return not self.alive
+    
+    def check_collision_and_move(self):
+        """
+        Move snake and check for collisions.
+        Returns: True if snake is still alive, False if dead
+        """
+        if not self.alive:
+            return False
+            
+        now = ticks_ms()
+        if ticks_diff(now, self.last_move) < self.speed:
+            return True  # Still alive, not time to move yet
+
+        self.last_move = now
+        hx, hy = self.snake[0]
+        dx, dy = self.direction
+        new_head = (hx + dx, hy + dy)
+
+        # Check collision with walls
+        if new_head[0] < 0 or new_head[0] >= self.GRID_W:
+            self.alive = False
+            return False
+            
+        # Check collision with walls (Y axis)
+        if new_head[1] < 0 or new_head[1] >= self.GRID_H:
+            self.alive = False
+            return False
+            
+        # Check collision with self
+        if new_head in self.snake:
+            self.alive = False
+            return False
+
+        self.snake.insert(0, new_head)
+
+        # Check if food eaten
+        if new_head == self.food:
+            self.score += 1
+            self.food = self.place_food()
+            if self.speed > 60:
+                self.speed -= 5
+        else:
+            self.snake.pop()
+            
+        return True  # Snake is still alive
+
+    # ---------------- Draw ----------------
+    def draw(self):
+        # Draw game state on OLED
+        if not self.alive:
+            return
+            
+        self.clear()
+        # Draw snake
+        for sx, sy in self.snake:
+            self.draw_cell(sx, sy)
+        # Draw food
+        fx, fy = self.food
+        self.draw_cell(fx, fy)
+        # Draw score (using small font at top-left)
+        self.oled.text("Score: " + str(self.score), 0, 0)
+        self.oled.show()
+    
+    # ---------------- Optional: Additional Features ----------------
+    def get_score(self):
+        # Return current score
+        return self.score
+    
+    def is_game_active(self):
+        # Return True if game is still active
+        return self.alive
+</code></pre>
+
+</div>
+
+<script>
+function copyCode() {
+
+    const code =
+        document.getElementById("codeBlock").innerText;
+
+    navigator.clipboard.writeText(code)
+    .then(() => {
+
+        const btn =
+            document.querySelector(".copy-btn");
+
+        btn.innerText = "Copied!";
+
+        setTimeout(() => {
+            btn.innerText = "Copy Code";
+        }, 1500);
+    });
+}
+</script>
+
+</body>
+</html>
